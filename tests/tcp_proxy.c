@@ -13,11 +13,12 @@
 #include <errno.h>
 
 #define PROXY_PORT   10001
-#define SERVER_PORT  10000
+#define SERVER_PORT  8000
 #define MAX_THREADS      8
 #define NUM_THREADS      4
 #define NUM_CONNS       32
-#define MAX_FDS        256
+//#define MAX_FDS        256
+#define MAX_FDS        64
 
 #define TRUE             1
 #define FALSE            0
@@ -45,6 +46,12 @@ void *proxy_th(void *pargs_void_ptr)
     int    pipes[2];
 #else
     char   buffer[262 * 1024];
+    //char   tmp_buf[262 * 1024 * MAX_FDS];
+    char   tmp_buf[8 * 1024 * MAX_FDS];
+    int    is_remain[MAX_FDS];
+    for(int i=0;i<MAX_FDS; i++){
+        is_remain[i] = 0;
+    }
 #endif
 
 #if EPOLL
@@ -261,19 +268,74 @@ void *proxy_th(void *pargs_void_ptr)
                   }
 
                   int nbytes = rc;
+                 
+                  char *status_offset;
+                  //status_offset = strstr(buffer, "HTTP/1.1 200 ");
+                  status_offset = strstr(buffer, "200 OK");
+                  //status_offset = strstr(buffer, "200");
+                  if(status_offset != NULL ){
+                      //printf(" HOGE %s %d\n ", status_offset, rc);
+                      status_offset = strstr(buffer, "Content-Length: ");
+                      int applen = atoi(status_offset+16);
+                      printf(" maybe resp header: the app length %d\n", applen);
 
-                  /**********************************************/
-                  /* Forward the data to the remote server      */
-                  /**********************************************/
-                  rc = send(fd_map[ready_fd], buffer, nbytes, MSG_DONTWAIT);
-                  if (rc < 0)
-                  {
-                     perror("  send:");
-                     close_conn = TRUE;
-                     break;
+                      status_offset = strstr(buffer,"\r\n\r\n");
+                      if ( status_offset ) status_offset += 2;
+                      printf("PAYLOAD: %s\n", status_offset);
+                      int payload_len = strlen(status_offset);
+                      printf("PAYLOAD LEN: %d\n", payload_len);
+                      if(payload_len - 2 != applen){
+                          is_remain[ready_fd] = nbytes;
+                          char *p = (char*)&tmp_buf[ready_fd];
+                          strncpy(p, buffer, nbytes);
+                          printf(" copy done!!\n");
+                          continue;
+                      }else{
+                          is_remain[ready_fd] = 0;
+                      }
                   }
-                  if (rc != nbytes)
-                     printf("Incomplete send %d < %d\n", rc, nbytes);
+
+                  if(is_remain[ready_fd] == 0){
+                      /**********************************************/
+                      /* Forward the data to the remote server      */
+                      /**********************************************/
+                      rc = send(fd_map[ready_fd], buffer, nbytes, MSG_DONTWAIT);
+                      if (rc < 0)
+                      {
+                         perror("  send:");
+                         close_conn = TRUE;
+                         break;
+                      }
+                      if (rc != nbytes)
+                         printf("Incomplete send %d < %d\n", rc, nbytes);
+                  }else{
+                      
+                      char *p =  (char *)&tmp_buf[ready_fd];
+                      for(int j=0;j<nbytes;j++){
+                          p[is_remain[ready_fd]+j] = buffer[j];
+                          //printf("%d,%c,%c\n",j,p[is_remain[ready_fd]+j],buffer[j]);
+                      }
+                      printf(" COPY PAYLOAD \n");
+                      for(int j=0;j<nbytes + is_remain[ready_fd];j++){
+                          printf("%c",p[j]);
+                      }
+                      printf(" COPY PAYLOAD DONE \n");
+                      
+                      rc = send(fd_map[ready_fd], 
+                             &tmp_buf[ready_fd], 
+                             nbytes + is_remain[ready_fd], MSG_DONTWAIT);
+
+                      if (rc < 0)
+                      {
+                         perror("  send:");
+                         close_conn = TRUE;
+                         break;
+                      }
+                      if (rc != nbytes + is_remain[ready_fd])
+                         printf("Incomplete send %d < %d\n", rc, nbytes);
+
+                      is_remain[ready_fd] = 0;
+                  }
 #endif
                } while (close_conn == FALSE);
 
